@@ -107,7 +107,7 @@ func (e *CacheEmbedder) EmbedDocuments(
 	for i, vec := range generated {
 		idx := missingIndexes[i]
 		vectors[idx] = append([]float32(nil), vec...)
-		e.cache.Set(missingTexts[idx], vec)
+		e.cache.Set(missingTexts[i], vec)
 	}
 
 	return vectors, nil
