@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/tmc/langchaingo/embeddings"
-	vectorstores "github.com/tmc/langchaingo/vectorstores"
+	"github.com/tmc/langchaingo/vectorstores"
 	qdrantstore "github.com/tmc/langchaingo/vectorstores/qdrant"
 
-	"gorag/engine/models"
+	"github.com/raykavin/gorag/pkg/models"
 )
 
 const (

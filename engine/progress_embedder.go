@@ -10,22 +10,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const (
-	defEmbedWorkers   = 10
-	defEmbedBatchSize = 16
-)
-
 var (
 	ErrNilEmbedder           = fmt.Errorf("base embedder cannot be nil")
 	ErrUninitializedEmbedder = fmt.Errorf("progress embedder not initialized")
 )
-
-// batch holds the original indexes
-// and corresponding texts for one parallel unit of work.
-type batch struct {
-	indexes []int
-	texts   []string
-}
 
 // ProgressEmbedder wraps an Embedder to process documents in parallel batches,
 // logging progress as chunks are embedded.

@@ -3,8 +3,8 @@ package engine
 import (
 	"context"
 	"errors"
-	"gorag/engine/cache"
 
+	"github.com/raykavin/gorag/cache"
 	"github.com/tmc/langchaingo/embeddings"
 )
 

@@ -1,11 +1,12 @@
 package cache
 
 import (
-	"gorag/engine/models"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/raykavin/gorag/pkg/models"
 
 	gocache "github.com/patrickmn/go-cache"
 )

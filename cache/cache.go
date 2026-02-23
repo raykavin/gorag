@@ -3,9 +3,10 @@ package cache
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"gorag/engine/models"
 	"regexp"
 	"strings"
+
+	"github.com/raykavin/gorag/pkg/models"
 )
 
 var (

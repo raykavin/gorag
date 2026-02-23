@@ -6,18 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"gorag/engine/models"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-)
 
-const (
-	defTextChunkSize    = 1200
-	defTextChunkOverlap = 180
-	defCSVRowsPerChunk  = 20
+	"github.com/raykavin/gorag/pkg/models"
 )
 
 var (
