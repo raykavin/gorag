@@ -1,5 +1,5 @@
 {
-    "name": "My Application DevContainer (Golang)",
+    "name": "RAG Engine DevContainer (Golang)",
     "workspaceFolder": "/workspaces/app",
     "dockerComposeFile": [
         "../docker-compose.dev.yml"
