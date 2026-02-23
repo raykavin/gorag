@@ -1,80 +1,88 @@
 #!/bin/sh
 set -e
 
-echo "> Configuring Git"
+# HELPERS
+log() { echo "> $*"; }
+info() { echo "  $*"; }
 
-# Initialize git repo if it does not exist
+# GIT
+log "Configuring Git"
+
 if [ ! -d ".git" ]; then
-  echo "Initializing Git repository (branch: $GIT_INIT_DEFAULT_BRANCH)"
+  info "Initializing repository (branch: $GIT_INIT_DEFAULT_BRANCH)"
   git init --initial-branch="$GIT_INIT_DEFAULT_BRANCH"
 else
-  echo "Git repository already exists, skipping init"
+  info "Repository already exists, skipping init"
 fi
 
-# Configure safe directory and user
 git config --global --add safe.directory "/workspaces/app"
-git config --global user.name "$DEVELOPER_NAME"
-git config --global user.email "$DEVELOPER_EMAIL"
+git config --global user.name  "$GIT_CONFIG_DEV_USERNAME"
+git config --global user.email "$GIT_CONFIG_DEV_EMAIL"
 
-# Configure remote upstream
 if git remote | grep -q "^origin$"; then
   CURRENT_URL="$(git remote get-url origin)"
   if [ "$CURRENT_URL" != "$GIT_REPO_ADDRESS" ]; then
-    echo "Updating origin remote URL"
+    info "Updating origin URL"
     git remote set-url origin "$GIT_REPO_ADDRESS"
   else
-    echo "Origin remote already configured correctly"
+    info "Origin already configured correctly"
   fi
 else
-  echo "Adding origin remote"
+  info "Adding origin remote"
   git remote add origin "$GIT_REPO_ADDRESS"
 fi
 
-# Ensure branch tracks origin
 if git show-ref --verify --quiet "refs/heads/$GIT_INIT_DEFAULT_BRANCH"; then
   git branch --set-upstream-to="origin/$GIT_INIT_DEFAULT_BRANCH" "$GIT_INIT_DEFAULT_BRANCH" 2>/dev/null || true
 fi
 
-echo "> Adjusting Go directories permissions"
+# GO ENVIRONMENT
+log "Adjusting Go directory permissions"
 sudo chmod -R 777 /go/bin /go/pkg
 
-echo "> Ensuring GOPATH is in PATH"
+log "Ensuring GOPATH is in PATH"
 export PATH="$PATH:/go/bin"
 
-echo "> Initializing Go modules"
+log "Initializing Go modules"
 if [ ! -f go.mod ]; then
-  echo "Creating Go Module with project name: $PROJECT_NAME"
+  info "Creating module: $PROJECT_NAME"
   go mod init "$PROJECT_NAME"
 else
-  echo "go.mod already exists, skipping module init"
+  info "go.mod already exists, skipping"
 fi
-
 go mod tidy
 
-echo "> Installing Go development tools"
+if [ -n "$GOPRIVATE" ]; then
+  log "Setting private Go repositories"
+  go env -w GOPRIVATE="$GOPRIVATE"
+fi
 
+# GO TOOLS
+log "Installing Go development tools"
 go install golang.org/x/tools/gopls@latest
 go install golang.org/x/tools/cmd/goimports@latest
 go install github.com/go-delve/delve/cmd/dlv@latest
 go install honnef.co/go/tools/cmd/staticcheck@latest
 go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 
-echo "> Verifying installed tools"
+log "Verifying installed tools"
 gopls version
 dlv version
 golangci-lint version
 
-echo "> Running initial lint"
+log "Running initial lint"
 golangci-lint run || true
 
-echo "> Checking out a develop branch"
+# BRANCH SETUP
+log "Checking out develop branch"
 if git show-ref --verify --quiet "refs/heads/develop"; then
   if git rev-parse --abbrev-ref HEAD | grep -q "^develop$"; then
-    echo "Already on develop branch"
+    info "Already on develop branch"
   else
-    echo "Switching to develop branch"
+    info "Switching to develop branch"
     git checkout develop
   fi
 fi
 
-echo "Post-create completed successfully"
+echo ""
+log "Post-create completed successfully"

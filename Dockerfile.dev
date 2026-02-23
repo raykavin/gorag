@@ -1,50 +1,26 @@
-FROM golang:1.25.1-trixie AS devcontainer
+# Base Image
+FROM mcr.microsoft.com/devcontainers/go:2.0.2-1.25-trixie AS devcontainer
 
-# Environment variables
+# Environment
 ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=America/Belem
 
-# Arguments expected by Dev Container
-ARG USERNAME=vscode
-ARG USER_UID=1000
-ARG USER_GID=1000
+# Fix Debian Trixie (remove broken Yarn repo)
+RUN rm -f /etc/apt/sources.list.d/yarn.list
 
-# Install fish and basic dependencies
+# Install additional packages 
 RUN apt-get update && apt-get install -y \
     fish \
-    sudo \
-    git \
-    curl \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Create group if it doesn't exist
-RUN if ! getent group $USERNAME >/dev/null; then \
-    groupadd --gid $USER_GID $USERNAME 2>/dev/null || groupadd $USERNAME; \
-    fi
+# Configure timezone
+RUN ln -snf /usr/share/zoneinfo/America/Belem /etc/localtime \
+    && echo America/Belem > /etc/timezone
 
-# Create user if it doesn't exist
-# Add user to sudo group and set fish as default shell
-RUN if ! getent group $USERNAME >/dev/null; then \
-    groupadd --gid $USER_GID $USERNAME 2>/dev/null || groupadd $USERNAME; \
-    fi \
-    && if ! id -u $USERNAME >/dev/null 2>&1; then \
-    useradd --uid $USER_UID --gid $(getent group $USERNAME | cut -d: -f3) -m $USERNAME 2>/dev/null || \
-    useradd --gid $(getent group $USERNAME | cut -d: -f3) -m $USERNAME; \
-    fi \
-    && usermod -aG sudo $USERNAME \
-    && echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
-    && chmod 0440 /etc/sudoers.d/$USERNAME
+# Set fish as default shell for vscode user
+RUN chsh -s /usr/bin/fish vscode
 
-# Set default shell to fish
-RUN chsh -s /usr/bin/fish $USERNAME
+# Default user
+USER vscode
 
-# Change ownership of working directory to vscode user
-RUN chown -R $USERNAME:$USERNAME .
-
-# Set default user
-USER $USERNAME
-
-# Expose port
-EXPOSE 3000
-
-# Run fish by default
 CMD ["fish"]

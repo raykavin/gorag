@@ -1,34 +1,16 @@
 services:
-  # postgres:
-  #   image: postgres:16.11-alpine3.23
-  #   restart: on-failure
-  #   env_file:
-  #     - .env
-  #   container_name: dev_postgres
-  #   networks:
-  #     devnet:
-  #   ports:
-  #     - "5432:5432"
-  #   volumes:
-  #     - ../.docker/postgres/data:/var/lib/postgresql/data
-  #     - ../.docker/postgres/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
-
   golang:
     tty: true
     container_name: dev_golang
     restart: on-failure
     working_dir: /workspaces/app
-    env_file: .env
+    env_file: .env.dev
     build:
-      context: "."
+      context: .
+      dockerfile: Dockerfile.dev
       target: devcontainer
-      dockerfile: "Dockerfile.dev"
-    # depends_on:
-    #   - postgres
     networks:
-      devnet:
-    # ports:
-    #   - "3000:3000"
+      - devnet
     volumes:
       - ./:/workspaces/app:rw
       - ../.docker/go/bin:/go/bin:rw

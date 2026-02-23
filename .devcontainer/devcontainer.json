@@ -7,9 +7,6 @@
     "service": "golang",
     "remoteUser": "vscode",
     "postCreateCommand": "sh ./.devcontainer/post-create.sh",
-    "features": {
-        "ghcr.io/devcontainers/features/git:1": {}
-    },
     "customizations": {
         "vscode": {
             "extensions": [
@@ -30,9 +27,7 @@
             "settings": {
                 "terminal.integrated.defaultProfile.linux": "fish",
                 "go.toolsManagement.checkForUpdates": "local",
-                "go.useLanguageServer": true,
-                "go.gopath": "/go",
-                "go.goroot": "/usr/local/go"
+                "go.useLanguageServer": true
             }
         }
     }

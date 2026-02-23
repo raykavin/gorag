@@ -13,13 +13,6 @@ Provide a consistent Go development environment using **Dev Containers**, avoidi
 - Basic tools for Go development  
 - Simple and reusable setup  
 
-## Project Architecture
-
-Any folder or project structure included in this repository is **only an example**.  
-You are free to **remove it, modify it, or rebuild the architecture entirely** according to your own preferences and project needs.
-
-This template is meant to support your workflow, not enforce a specific structure.
-
 ## How to Use
 
 1. Clone this repository:

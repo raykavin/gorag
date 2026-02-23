@@ -1,35 +1,55 @@
-FROM golang:1.24.5-alpine3.22 AS build
+# Global build arguments
+ARG GO_BUILD_BASE_IMAGE=1.25.7-alpine3.23
+ARG GO_BUILD_FLAGS=""
+ARG PROJECT_NAME="my-app"
+ARG TZ=America/Belem
+
+# Build stage
+FROM golang:${GO_BUILD_BASE_IMAGE} AS build
+
+# Re-declare args for this stage
+ARG PROJECT_NAME
+ARG GO_BUILD_FLAGS
+ARG TZ
 
 ENV APP_NAME=${PROJECT_NAME}
+ENV TZ=${TZ}
 
 WORKDIR /build
 
 # Install build dependencies
-RUN apk update && \
-    apk add --no-cache git gcc musl-dev tzdata
+RUN apk add --no-cache git gcc musl-dev tzdata
 
 # Set timezone
 RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && \
     echo ${TZ} > /etc/timezone
 
+# Copy go mod first for better caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy rest of source
 COPY . .
 
-# Build the Go application with CGO enabled
+# Build application
 RUN CGO_ENABLED=1 go build ${GO_BUILD_FLAGS} -o ${APP_NAME} cmd/api/main.go
 
+# Runtime stage
 FROM alpine:3.22 AS runtime
 
-ENV APP_NAME=${PROJECT_NAME}
+# Re-declare args for this stage
+ARG PROJECT_NAME
 ARG APP_USER_ID=1001
 ARG APP_GROUP_ID=1001
 ARG TZ=America/Belem
 
-ENV APP_HOME=/${APP_NAME} \
-    LOG_DIR=/var/log/${APP_NAME}
+ENV APP_NAME=${PROJECT_NAME}
+ENV TZ=${TZ}
+ENV APP_HOME=/${APP_NAME}
+ENV LOG_DIR=/var/log/${APP_NAME}
 
 # Install runtime dependencies
-RUN apk update && \
-    apk add --no-cache ca-certificates tzdata curl wget bash
+RUN apk add --no-cache ca-certificates tzdata curl wget bash
 
 # Set timezone
 RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && \
@@ -41,24 +61,18 @@ RUN addgroup -g ${APP_GROUP_ID} ${APP_NAME} && \
     mkdir -p ${APP_HOME} ${LOG_DIR} && \
     chown -R ${APP_NAME}:${APP_NAME} ${APP_HOME} ${LOG_DIR}
 
-# Copy the compiled binary from build stage
+# Copy binary from build stage
 COPY --from=build --chown=${APP_NAME}:${APP_NAME} /build/${APP_NAME} /usr/local/bin/${APP_NAME}
 
-# Copy healthcheck script if exists
-# COPY --chown=${APP_NAME}:${APP_NAME} ./scripts/sh/healthcheck.sh /usr/local/bin/
+# Ensure binary is executable
+RUN chmod +x /usr/local/bin/${APP_NAME}
 
-# Make binaries executable
-RUN if [ -f /usr/local/bin/healthcheck.sh ]; then \
-        chmod +x /usr/local/bin/healthcheck.sh; \
-    fi && \
-    chmod +x /usr/local/bin/${APP_NAME}
-
-# Use non-root user
+# Switch to non-root user
 USER ${APP_NAME}
 
 WORKDIR ${APP_HOME}
 
-# Define volumes for data and logs
+# Define volumes
 VOLUME ["${APP_HOME}", "${LOG_DIR}"]
 
 # Healthcheck configuration
@@ -72,5 +86,5 @@ VOLUME ["${APP_HOME}", "${LOG_DIR}"]
 # Expose application port
 # EXPOSE 3000
 
-# Entrypoint 
-ENTRYPOINT ["/bin/sh", "-c", "/usr/local/bin/$APP_NAME -config $APP_HOME/config.yml"]
+# Entrypoint
+ENTRYPOINT ["/bin/sh", "-c", "/usr/local/bin/${APP_NAME} -config ${APP_HOME}/config.yml"]
