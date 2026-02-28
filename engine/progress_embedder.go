@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"sync/atomic"
 
 	"github.com/tmc/langchaingo/embeddings"
@@ -106,7 +105,7 @@ func (e *ProgressEmbedder) EmbedDocuments(
 }
 
 // processBatch embeds a single batch and writes results into the shared vectors slice.
-func (e *ProgressEmbedder) processBatch(ctx context.Context, b batch, vectors [][]float32, total int64) error {
+func (e *ProgressEmbedder) processBatch(ctx context.Context, b batch, vectors [][]float32, _ int64) error {
 	batchVectors, err := e.base.EmbedDocuments(ctx, b.texts)
 	if err != nil {
 		return err
@@ -119,11 +118,11 @@ func (e *ProgressEmbedder) processBatch(ctx context.Context, b batch, vectors []
 		idx := b.indexes[i]
 		vectors[idx] = vec
 
-		current := e.processed.Add(1)
-		slog.InfoContext(ctx, "embedding chunk",
-			"progress", fmt.Sprintf("%d/%d", current, total),
-			"chunk_index", idx+1,
-		)
+		// current e.processed.Add(1)
+		// slog.InfoContext(ctx, "embedding chunk",
+		// 	"progress", fmt.Sprintf("%d/%d", current, total),
+		// 	"chunk_index", idx+1,
+		// )
 	}
 	return nil
 }

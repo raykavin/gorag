@@ -3,7 +3,10 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/tmc/langchaingo/schema"
 	"github.com/tmc/langchaingo/vectorstores"
@@ -15,11 +18,25 @@ import (
 type RetrievalMode string
 
 const (
-	RetrievalDense    RetrievalMode = "dense"
-	RetrievalReranker RetrievalMode = "reranker"
+	RetrievalDense          RetrievalMode = "dense"
+	RetrievalReranker       RetrievalMode = "reranker"
+	RetrievalHybrid         RetrievalMode = "hybrid"
+	RetrievalHybridReranker RetrievalMode = "hybrid_reranker"
 
-	defaultTopK     = 3
-	defaultMinScore = float32(0.7)
+	defaultTopK              = 3
+	defaultMinScore          = float32(0.7)
+	defaultContextMaxChars   = 6000
+	defaultChunkMaxChars     = 1200
+	defaultHybridMultiplier  = 3
+	defaultRRFConstant       = 60.0
+	bm25K1                   = 1.2
+	bm25B                    = 0.75
+	defaultMinTokenLength    = 2
+	defaultTruncateLookback  = 48
+	defaultTruncateEllipsis  = "..."
+	defaultChunkIDPrefix     = "rank_"
+	defaultContextHeaderOpen = "["
+	defaultContextHeaderEnd  = "]"
 )
 
 // RAGEngine retrieves relevant document chunks from a vector store
@@ -34,6 +51,9 @@ type RAGEngine struct {
 	retrievalMode RetrievalMode
 	rerankerK     int
 	chunksLoaded  int
+	keywordIndex  *keywordIndex
+	contextMax    int
+	chunkMax      int
 }
 
 // Config holds the configuration parameters for a RAGEngine.
@@ -44,6 +64,9 @@ type Config struct {
 	RetrievalMode string
 	RerankerK     int
 	ChunksLoaded  int
+	KeywordDocs   []schema.Document
+	ContextMax    int
+	ChunkMax      int
 }
 
 // NewRAGEngine creates a RAGEngine with the given store, reranker, cache and config.
@@ -62,6 +85,15 @@ func NewRAGEngine(
 	if cfg.RerankerK < cfg.TopK {
 		cfg.RerankerK = cfg.TopK
 	}
+	if cfg.ContextMax <= 0 {
+		cfg.ContextMax = defaultContextMaxChars
+	}
+	if cfg.ChunkMax <= 0 {
+		cfg.ChunkMax = defaultChunkMaxChars
+	}
+	if cfg.ChunkMax > cfg.ContextMax {
+		cfg.ChunkMax = cfg.ContextMax
+	}
 	return &RAGEngine{
 		store:         store,
 		reranker:      reranker,
@@ -69,9 +101,12 @@ func NewRAGEngine(
 		topK:          cfg.TopK,
 		minScore:      cfg.MinScore,
 		forceAlways:   cfg.ForceAlways,
-		retrievalMode: normalizeRetrievalMode(cfg.RetrievalMode),
 		rerankerK:     cfg.RerankerK,
 		chunksLoaded:  cfg.ChunksLoaded,
+		keywordIndex:  newKeywordIndex(cfg.KeywordDocs),
+		contextMax:    cfg.ContextMax,
+		chunkMax:      cfg.ChunkMax,
+		retrievalMode: normalizeRetrievalMode(cfg.RetrievalMode),
 	}
 }
 
@@ -91,18 +126,16 @@ func (r *RAGEngine) Query(ctx context.Context, query string) (string, bool, erro
 	if err != nil {
 		return "", false, err
 	}
-
-	lines := make([]string, 0, len(results))
-	for _, res := range results {
-		if content := strings.TrimSpace(res.PageContent); content != "" {
-			lines = append(lines, content)
-		}
+	results = filterByMinScore(results, r.minScore)
+	if len(results) == 0 {
+		return "", false, nil
 	}
-	if len(lines) == 0 {
+	context := buildContextBlock(results, r.contextMax, r.chunkMax)
+	if context == "" {
 		return "", false, nil
 	}
 
-	return buildContextBlock(lines), true, nil
+	return context, true, nil
 }
 
 // ChunksLoaded returns the number of knowledge chunks loaded into the store.
@@ -126,6 +159,10 @@ func (r *RAGEngine) retrieve(ctx context.Context, query string) ([]schema.Docume
 	switch r.retrievalMode {
 	case RetrievalReranker:
 		return r.retrieveWithReranker(ctx, query)
+	case RetrievalHybrid:
+		return r.retrieveHybrid(ctx, query, false)
+	case RetrievalHybridReranker:
+		return r.retrieveHybrid(ctx, query, true)
 	default:
 		return r.searchDense(ctx, query, r.topK)
 	}
@@ -150,6 +187,51 @@ func (r *RAGEngine) retrieveWithReranker(ctx context.Context, query string) ([]s
 		return nil, fmt.Errorf("reranker failed: %w", err)
 	}
 	return reranked, nil
+}
+
+// retrieveHybrid fuses dense and keyword retrieval with RRF and optionally reranks.
+func (r *RAGEngine) retrieveHybrid(ctx context.Context, query string, withReranker bool) ([]schema.Document, error) {
+	if withReranker && r.reranker == nil {
+		return nil, fmt.Errorf("hybrid_reranker mode is active but no reranker was provided")
+	}
+
+	candidatesK := r.hybridCandidatesK()
+	dense, err := r.searchDense(ctx, query, candidatesK)
+	if err != nil {
+		return nil, err
+	}
+	dense = filterByMinScore(dense, r.minScore)
+	if len(dense) == 0 {
+		return nil, nil
+	}
+
+	denseKeys := make(map[string]struct{}, len(dense))
+	for _, doc := range dense {
+		denseKeys[documentKey(doc)] = struct{}{}
+	}
+
+	keyword := filterDocsByKeys(r.searchKeyword(query, candidatesK), denseKeys)
+
+	candidates := reciprocalRankFusion(candidatesK, dense, keyword)
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	if withReranker {
+		if len(candidates) > r.rerankerK {
+			candidates = candidates[:r.rerankerK]
+		}
+		reranked, err := r.reranker.Rerank(ctx, query, candidates, r.topK)
+		if err != nil {
+			return nil, fmt.Errorf("reranker failed: %w", err)
+		}
+		return reranked, nil
+	}
+
+	if len(candidates) > r.topK {
+		candidates = candidates[:r.topK]
+	}
+	return candidates, nil
 }
 
 // searchDense performs a similarity search with an optional score threshold.
@@ -195,17 +277,192 @@ func (r *RAGEngine) searchDenseCandidates(ctx context.Context, query string) ([]
 	return mergeUniqueDocuments(candidates, fallback, r.rerankerK), nil
 }
 
-// buildContextBlock formats retrieved lines into a prompt-ready context block.
-func buildContextBlock(lines []string) string {
+func (r *RAGEngine) hybridCandidatesK() int {
+	k := r.topK * defaultHybridMultiplier
+	if k < r.rerankerK {
+		k = r.rerankerK
+	}
+	if k < r.topK {
+		k = r.topK
+	}
+	return k
+}
+
+// searchKeyword performs lexical retrieval over the in-memory keyword index.
+func (r *RAGEngine) searchKeyword(query string, topK int) []schema.Document {
+	if r.keywordIndex == nil {
+		return nil
+	}
+	if topK <= 0 {
+		topK = r.topK
+	}
+	return r.keywordIndex.search(query, topK)
+}
+
+// buildContextBlock formats retrieved docs into a prompt-ready context block.
+func buildContextBlock(docs []schema.Document, maxContextChars, maxChunkChars int) string {
+	if maxContextChars <= 0 {
+		maxContextChars = defaultContextMaxChars
+	}
+	if maxChunkChars <= 0 {
+		maxChunkChars = defaultChunkMaxChars
+	}
+	if maxChunkChars > maxContextChars {
+		maxChunkChars = maxContextChars
+	}
+
 	var b strings.Builder
-	_, _ = b.WriteString("## Relevant Context\n")
-	for i, line := range lines {
-		_, _ = b.WriteString(line)
-		if i < len(lines)-1 {
-			_, _ = b.WriteString("\n\n")
+
+	for idx, doc := range docs {
+		content := strings.TrimSpace(doc.PageContent)
+		if content == "" {
+			continue
+		}
+
+		content = truncateText(content, maxChunkChars)
+		header := contextHeader(idx+1, doc)
+		entry := header + "\n" + content
+
+		prefix := ""
+		if b.Len() > 0 {
+			prefix = "\n\n"
+		}
+
+		if b.Len()+len(prefix)+len(entry) > maxContextChars {
+			if b.Len() > 0 {
+				break
+			}
+
+			allowed := maxContextChars - len(header) - 1
+			if allowed <= 0 {
+				break
+			}
+			entry = header + "\n" + truncateText(content, allowed)
+		}
+
+		if prefix != "" {
+			_, _ = b.WriteString(prefix)
+		}
+		_, _ = b.WriteString(entry)
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
+func contextHeader(rank int, doc schema.Document) string {
+	id, ok := metadataString(doc.Metadata, "id")
+	if !ok {
+		id = defaultChunkIDPrefix + fmt.Sprintf("%d", rank)
+	}
+
+	parts := []string{"chunk_id=" + id}
+	if source, ok := metadataString(doc.Metadata, "source"); ok {
+		parts = append(parts, "source="+source)
+	}
+	if category, ok := metadataString(doc.Metadata, "category"); ok {
+		parts = append(parts, "category="+category)
+	}
+	if doc.Score > 0 {
+		parts = append(parts, fmt.Sprintf("score=%.4f", doc.Score))
+	}
+
+	return defaultContextHeaderOpen + strings.Join(parts, " | ") + defaultContextHeaderEnd
+}
+
+// reciprocalRankFusion merges ranked lists using RRF scoring.
+func reciprocalRankFusion(limit int, rankedLists ...[]schema.Document) []schema.Document {
+	if limit <= 0 {
+		limit = defaultTopK
+	}
+
+	type scoredDoc struct {
+		doc   schema.Document
+		score float64
+		key   string
+	}
+
+	byKey := make(map[string]*scoredDoc, limit*2)
+	for _, list := range rankedLists {
+		for rank, doc := range list {
+			if strings.TrimSpace(doc.PageContent) == "" {
+				continue
+			}
+			key := documentKey(doc)
+			score := 1.0 / (defaultRRFConstant + float64(rank+1))
+
+			current, ok := byKey[key]
+			if !ok {
+				copied := doc
+				byKey[key] = &scoredDoc{doc: copied, score: score, key: key}
+				continue
+			}
+			current.score += score
+			// Preserve the best native score (e.g., vector similarity) instead of
+			// replacing it with the RRF score, so MinScore semantics remain stable.
+			if doc.Score > current.doc.Score {
+				current.doc.Score = doc.Score
+			}
 		}
 	}
-	return b.String()
+
+	if len(byKey) == 0 {
+		return nil
+	}
+
+	all := make([]scoredDoc, 0, len(byKey))
+	for _, item := range byKey {
+		all = append(all, *item)
+	}
+
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].score == all[j].score {
+			return all[i].key < all[j].key
+		}
+		return all[i].score > all[j].score
+	})
+
+	if len(all) > limit {
+		all = all[:limit]
+	}
+
+	out := make([]schema.Document, 0, len(all))
+	for _, item := range all {
+		doc := item.doc
+		if doc.Metadata == nil {
+			doc.Metadata = map[string]any{}
+		}
+		doc.Metadata["hybrid_rrf_score"] = item.score
+		out = append(out, doc)
+	}
+	return out
+}
+
+func filterByMinScore(docs []schema.Document, minScore float32) []schema.Document {
+	if minScore <= 0 || len(docs) == 0 {
+		return docs
+	}
+
+	filtered := docs[:0]
+	for _, doc := range docs {
+		if doc.Score >= minScore {
+			filtered = append(filtered, doc)
+		}
+	}
+	return filtered
+}
+
+func filterDocsByKeys(docs []schema.Document, allowed map[string]struct{}) []schema.Document {
+	if len(docs) == 0 || len(allowed) == 0 {
+		return nil
+	}
+
+	filtered := docs[:0]
+	for _, doc := range docs {
+		if _, ok := allowed[documentKey(doc)]; ok {
+			filtered = append(filtered, doc)
+		}
+	}
+	return filtered
 }
 
 // mergeUniqueDocuments merges two document slices, deduplicating by key, up to topK results.
@@ -270,7 +527,229 @@ func normalizeRetrievalMode(mode string) RetrievalMode {
 	switch RetrievalMode(strings.ToLower(strings.TrimSpace(mode))) {
 	case RetrievalReranker:
 		return RetrievalReranker
+	case RetrievalHybrid:
+		return RetrievalHybrid
+	case RetrievalHybridReranker, "hybrid-reranker":
+		return RetrievalHybridReranker
 	default:
 		return RetrievalDense
 	}
+}
+
+type posting struct {
+	docIndex int
+	tf       int
+}
+
+type keywordIndex struct {
+	docs      []schema.Document
+	postings  map[string][]posting
+	docLen    []int
+	docFreq   map[string]int
+	avgDocLen float64
+}
+
+func newKeywordIndex(docs []schema.Document) *keywordIndex {
+	if len(docs) == 0 {
+		return nil
+	}
+
+	idx := &keywordIndex{
+		docs:     make([]schema.Document, 0, len(docs)),
+		postings: make(map[string][]posting, len(docs)*4),
+		docLen:   make([]int, 0, len(docs)),
+		docFreq:  make(map[string]int, len(docs)*4),
+	}
+
+	totalLen := 0
+	for _, doc := range docs {
+		content := strings.TrimSpace(doc.PageContent)
+		if content == "" {
+			continue
+		}
+
+		tokens := tokenize(content)
+		if len(tokens) == 0 {
+			continue
+		}
+
+		docIndex := len(idx.docs)
+		idx.docs = append(idx.docs, doc)
+		idx.docLen = append(idx.docLen, len(tokens))
+		totalLen += len(tokens)
+
+		tf := make(map[string]int, len(tokens))
+		for _, token := range tokens {
+			tf[token]++
+		}
+
+		for term, count := range tf {
+			idx.postings[term] = append(idx.postings[term], posting{
+				docIndex: docIndex,
+				tf:       count,
+			})
+			idx.docFreq[term]++
+		}
+	}
+
+	if len(idx.docs) == 0 {
+		return nil
+	}
+	idx.avgDocLen = float64(totalLen) / float64(len(idx.docs))
+	return idx
+}
+
+func (k *keywordIndex) search(query string, limit int) []schema.Document {
+	if k == nil || len(k.docs) == 0 {
+		return nil
+	}
+	if limit <= 0 {
+		limit = defaultTopK
+	}
+
+	queryTokens := tokenize(query)
+	if len(queryTokens) == 0 {
+		return nil
+	}
+
+	seenTerms := make(map[string]struct{}, len(queryTokens))
+	docScores := make(map[int]float64, limit*4)
+	n := float64(len(k.docs))
+
+	for _, term := range queryTokens {
+		if _, done := seenTerms[term]; done {
+			continue
+		}
+		seenTerms[term] = struct{}{}
+
+		postings, ok := k.postings[term]
+		if !ok || len(postings) == 0 {
+			continue
+		}
+
+		df := float64(k.docFreq[term])
+		idf := math.Log(1 + (n-df+0.5)/(df+0.5))
+
+		for _, p := range postings {
+			dl := float64(k.docLen[p.docIndex])
+			tf := float64(p.tf)
+
+			denom := tf + bm25K1*(1-bm25B+bm25B*(dl/k.avgDocLen))
+			if denom == 0 {
+				continue
+			}
+			score := idf * ((tf * (bm25K1 + 1)) / denom)
+			docScores[p.docIndex] += score
+		}
+	}
+
+	if len(docScores) == 0 {
+		return nil
+	}
+
+	type scored struct {
+		index int
+		score float64
+	}
+
+	scoredDocs := make([]scored, 0, len(docScores))
+	for idx, score := range docScores {
+		if score > 0 {
+			scoredDocs = append(scoredDocs, scored{index: idx, score: score})
+		}
+	}
+
+	if len(scoredDocs) == 0 {
+		return nil
+	}
+
+	sort.SliceStable(scoredDocs, func(i, j int) bool {
+		if scoredDocs[i].score == scoredDocs[j].score {
+			return scoredDocs[i].index < scoredDocs[j].index
+		}
+		return scoredDocs[i].score > scoredDocs[j].score
+	})
+
+	if len(scoredDocs) > limit {
+		scoredDocs = scoredDocs[:limit]
+	}
+
+	out := make([]schema.Document, 0, len(scoredDocs))
+	for _, item := range scoredDocs {
+		doc := k.docs[item.index]
+		doc.Score = float32(item.score)
+		out = append(out, doc)
+	}
+	return out
+}
+
+var lexicalStopwords = map[string]struct{}{
+	"a": {}, "ao": {}, "aos": {}, "as": {}, "com": {}, "da": {}, "das": {}, "de": {}, "do": {}, "dos": {},
+	"e": {}, "em": {}, "na": {}, "nas": {}, "no": {}, "nos": {}, "o": {}, "os": {}, "ou": {}, "para": {},
+	"por": {}, "que": {}, "se": {}, "sem": {}, "um": {}, "uma": {},
+}
+
+func tokenize(text string) []string {
+	text = strings.TrimSpace(strings.ToLower(text))
+	if text == "" {
+		return nil
+	}
+
+	var tokens []string
+	var b strings.Builder
+
+	flush := func() {
+		if b.Len() == 0 {
+			return
+		}
+		token := b.String()
+		b.Reset()
+		if len([]rune(token)) < defaultMinTokenLength {
+			return
+		}
+		if _, stop := lexicalStopwords[token]; stop {
+			return
+		}
+		tokens = append(tokens, token)
+	}
+
+	for _, r := range text {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			_, _ = b.WriteRune(r)
+			continue
+		}
+		flush()
+	}
+	flush()
+
+	return tokens
+}
+
+func truncateText(text string, maxChars int) string {
+	text = strings.TrimSpace(text)
+	if text == "" || maxChars <= 0 {
+		return ""
+	}
+
+	runes := []rune(text)
+	if len(runes) <= maxChars {
+		return text
+	}
+
+	end := maxChars
+	lookback := defaultTruncateLookback
+	if lookback > end {
+		lookback = end
+	}
+	for i := end; i > end-lookback; i-- {
+		if unicode.IsSpace(runes[i-1]) {
+			end = i - 1
+			break
+		}
+	}
+	if end <= 0 {
+		end = maxChars
+	}
+
+	return strings.TrimSpace(string(runes[:end])) + defaultTruncateEllipsis
 }
