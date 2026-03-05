@@ -1,4 +1,9 @@
-# Go RAG
+# gorag
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/raykavin/gorag.svg)](https://pkg.go.dev/github.com/raykavin/gorag)
+[![Go Version](https://img.shields.io/badge/go-1.21+-blue)](https://golang.org/dl/)
+[![Go Report Card](https://goreportcard.com/badge/github.com/raykavin/gorag)](https://goreportcard.com/report/github.com/raykavin/gorag)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
 
 A Go library for building Retrieval-Augmented Generation (RAG) flows with:
 - knowledge loading and chunking
@@ -193,10 +198,9 @@ GOCACHE=/tmp/go-build go test ./...
 ```
 
 ---
-
 ## Contributing
 
-Contributions to Go RAG are welcome! Here are some ways you can help improve the project:
+Contributions to gorag are welcome! Here are some ways you can help improve the project:
 
 - **Report bugs and suggest features** by opening issues on GitHub
 - **Submit pull requests** with bug fixes or new features
@@ -205,14 +209,14 @@ Contributions to Go RAG are welcome! Here are some ways you can help improve the
 
 ## License
 
-Go RAG is distributed under the **MIT License**.  
+gorag is distributed under the **MIT License**.  
 For complete license terms and conditions, see the [LICENSE](LICENSE.md) file in the repository.
 
 ---
 
 ## Contact
 
-For support, collaboration, or questions about Go RAG:
+For support, collaboration, or questions about gorag:
 
 **Email**: [raykavin.meireles@gmail.com](mailto:raykavin.meireles@gmail.com)  
 **GitHub**: [@raykavin](https://github.com/raykavin)  
