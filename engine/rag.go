@@ -45,15 +45,16 @@ type RAGEngine struct {
 	store         vectorstores.VectorStore
 	reranker      DocumentReranker
 	embCache      *cache.Embedding
+	keywordIndex  *keywordIndex
+	systemPrompt  string
+	retrievalMode RetrievalMode
 	topK          int
 	minScore      float32
-	forceAlways   bool
-	retrievalMode RetrievalMode
 	rerankerK     int
 	chunksLoaded  int
-	keywordIndex  *keywordIndex
 	contextMax    int
 	chunkMax      int
+	forceAlways   bool
 }
 
 // Config holds the configuration parameters for a RAGEngine.
@@ -67,6 +68,7 @@ type Config struct {
 	KeywordDocs   []schema.Document
 	ContextMax    int
 	ChunkMax      int
+	SystemPrompt  string
 }
 
 // NewRAGEngine creates a RAGEngine with the given store, reranker, cache and config.
@@ -94,6 +96,7 @@ func NewRAGEngine(
 	if cfg.ChunkMax > cfg.ContextMax {
 		cfg.ChunkMax = cfg.ContextMax
 	}
+
 	return &RAGEngine{
 		store:         store,
 		reranker:      reranker,
@@ -106,6 +109,7 @@ func NewRAGEngine(
 		keywordIndex:  newKeywordIndex(cfg.KeywordDocs),
 		contextMax:    cfg.ContextMax,
 		chunkMax:      cfg.ChunkMax,
+		systemPrompt:  strings.TrimSpace(cfg.SystemPrompt),
 		retrievalMode: normalizeRetrievalMode(cfg.RetrievalMode),
 	}
 }
@@ -126,10 +130,12 @@ func (r *RAGEngine) Query(ctx context.Context, query string) (string, bool, erro
 	if err != nil {
 		return "", false, err
 	}
+
 	results = filterByMinScore(results, r.minScore)
 	if len(results) == 0 {
 		return "", false, nil
 	}
+
 	context := buildContextBlock(results, r.contextMax, r.chunkMax)
 	if context == "" {
 		return "", false, nil
@@ -154,6 +160,14 @@ func (r *RAGEngine) EmbeddingCacheStats() cache.CacheStats {
 	return r.embCache.Stats()
 }
 
+// SystemPrompt returns the fixed system prompt context loaded at bootstrap.
+func (r *RAGEngine) SystemPrompt() string {
+	if r == nil {
+		return ""
+	}
+	return r.systemPrompt
+}
+
 // retrieve dispatches to the appropriate retrieval strategy.
 func (r *RAGEngine) retrieve(ctx context.Context, query string) ([]schema.Document, error) {
 	switch r.retrievalMode {
@@ -175,11 +189,8 @@ func (r *RAGEngine) retrieveWithReranker(ctx context.Context, query string) ([]s
 	}
 
 	candidates, err := r.searchDenseCandidates(ctx, query)
-	if err != nil {
+	if err != nil || len(candidates) == 0 {
 		return nil, err
-	}
-	if len(candidates) == 0 {
-		return nil, nil
 	}
 
 	reranked, err := r.reranker.Rerank(ctx, query, candidates, r.topK)
@@ -196,6 +207,7 @@ func (r *RAGEngine) retrieveHybrid(ctx context.Context, query string, withRerank
 	}
 
 	candidatesK := r.hybridCandidatesK()
+
 	dense, err := r.searchDense(ctx, query, candidatesK)
 	if err != nil {
 		return nil, err
@@ -205,31 +217,28 @@ func (r *RAGEngine) retrieveHybrid(ctx context.Context, query string, withRerank
 		return nil, nil
 	}
 
-	denseKeys := make(map[string]struct{}, len(dense))
-	for _, doc := range dense {
-		denseKeys[documentKey(doc)] = struct{}{}
-	}
-
+	denseKeys := docKeySet(dense)
 	keyword := filterDocsByKeys(r.searchKeyword(query, candidatesK), denseKeys)
-
 	candidates := reciprocalRankFusion(candidatesK, dense, keyword)
 	if len(candidates) == 0 {
 		return nil, nil
 	}
 
+	// Cap candidates before optional reranking, then trim to topK.
+	limit := r.topK
 	if withReranker {
-		if len(candidates) > r.rerankerK {
-			candidates = candidates[:r.rerankerK]
-		}
+		limit = r.rerankerK
+	}
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+
+	if withReranker {
 		reranked, err := r.reranker.Rerank(ctx, query, candidates, r.topK)
 		if err != nil {
 			return nil, fmt.Errorf("reranker failed: %w", err)
 		}
 		return reranked, nil
-	}
-
-	if len(candidates) > r.topK {
-		candidates = candidates[:r.topK]
 	}
 	return candidates, nil
 }
@@ -250,7 +259,6 @@ func (r *RAGEngine) searchDense(ctx context.Context, query string, topK int) ([]
 	}
 
 	if len(results) == 0 && r.forceAlways {
-		// Fallback without threshold to always return some context.
 		results, err = r.store.SimilaritySearch(ctx, query, topK)
 		if err != nil {
 			return nil, fmt.Errorf("semantic search fallback failed: %w", err)
@@ -332,7 +340,6 @@ func buildContextBlock(docs []schema.Document, maxContextChars, maxChunkChars in
 			if b.Len() > 0 {
 				break
 			}
-
 			allowed := maxContextChars - len(header) - 1
 			if allowed <= 0 {
 				break
@@ -397,8 +404,8 @@ func reciprocalRankFusion(limit int, rankedLists ...[]schema.Document) []schema.
 				continue
 			}
 			current.score += score
-			// Preserve the best native score (e.g., vector similarity) instead of
-			// replacing it with the RRF score, so MinScore semantics remain stable.
+			// Preserve the best native score (e.g., vector similarity) so that
+			// MinScore semantics remain stable after fusion.
 			if doc.Score > current.doc.Score {
 				current.doc.Score = doc.Score
 			}
@@ -437,12 +444,13 @@ func reciprocalRankFusion(limit int, rankedLists ...[]schema.Document) []schema.
 	return out
 }
 
+// filterByMinScore returns a new slice containing only documents whose score
+// meets or exceeds minScore. The original slice is never modified.
 func filterByMinScore(docs []schema.Document, minScore float32) []schema.Document {
 	if minScore <= 0 || len(docs) == 0 {
 		return docs
 	}
-
-	filtered := docs[:0]
+	filtered := make([]schema.Document, 0, len(docs))
 	for _, doc := range docs {
 		if doc.Score >= minScore {
 			filtered = append(filtered, doc)
@@ -451,18 +459,28 @@ func filterByMinScore(docs []schema.Document, minScore float32) []schema.Documen
 	return filtered
 }
 
+// filterDocsByKeys returns a new slice containing only documents whose key
+// appears in allowed. The original slice is never modified.
 func filterDocsByKeys(docs []schema.Document, allowed map[string]struct{}) []schema.Document {
 	if len(docs) == 0 || len(allowed) == 0 {
 		return nil
 	}
-
-	filtered := docs[:0]
+	filtered := make([]schema.Document, 0, len(docs))
 	for _, doc := range docs {
 		if _, ok := allowed[documentKey(doc)]; ok {
 			filtered = append(filtered, doc)
 		}
 	}
 	return filtered
+}
+
+// docKeySet builds a set of document keys from a slice, used for O(1) lookups.
+func docKeySet(docs []schema.Document) map[string]struct{} {
+	keys := make(map[string]struct{}, len(docs))
+	for _, doc := range docs {
+		keys[documentKey(doc)] = struct{}{}
+	}
+	return keys
 }
 
 // mergeUniqueDocuments merges two document slices, deduplicating by key, up to topK results.
@@ -480,7 +498,7 @@ func mergeUniqueDocuments(first, second []schema.Document, topK int) []schema.Do
 			if topK > 0 && len(out) >= topK {
 				return out
 			}
-			if content := strings.TrimSpace(doc.PageContent); content == "" {
+			if strings.TrimSpace(doc.PageContent) == "" {
 				continue
 			}
 			key := documentKey(doc)
@@ -582,12 +600,11 @@ func newKeywordIndex(docs []schema.Document) *keywordIndex {
 		for _, token := range tokens {
 			tf[token]++
 		}
-
 		for term, count := range tf {
-			idx.postings[term] = append(idx.postings[term], posting{
-				docIndex: docIndex,
-				tf:       count,
-			})
+			idx.postings[term] = append(
+				idx.postings[term],
+				posting{docIndex: docIndex, tf: count},
+			)
 			idx.docFreq[term]++
 		}
 	}
@@ -623,7 +640,7 @@ func (k *keywordIndex) search(query string, limit int) []schema.Document {
 		seenTerms[term] = struct{}{}
 
 		postings, ok := k.postings[term]
-		if !ok || len(postings) == 0 {
+		if !ok {
 			continue
 		}
 
@@ -633,13 +650,11 @@ func (k *keywordIndex) search(query string, limit int) []schema.Document {
 		for _, p := range postings {
 			dl := float64(k.docLen[p.docIndex])
 			tf := float64(p.tf)
-
 			denom := tf + bm25K1*(1-bm25B+bm25B*(dl/k.avgDocLen))
 			if denom == 0 {
 				continue
 			}
-			score := idf * ((tf * (bm25K1 + 1)) / denom)
-			docScores[p.docIndex] += score
+			docScores[p.docIndex] += idf * ((tf * (bm25K1 + 1)) / denom)
 		}
 	}
 
@@ -654,13 +669,7 @@ func (k *keywordIndex) search(query string, limit int) []schema.Document {
 
 	scoredDocs := make([]scored, 0, len(docScores))
 	for idx, score := range docScores {
-		if score > 0 {
-			scoredDocs = append(scoredDocs, scored{index: idx, score: score})
-		}
-	}
-
-	if len(scoredDocs) == 0 {
-		return nil
+		scoredDocs = append(scoredDocs, scored{index: idx, score: score})
 	}
 
 	sort.SliceStable(scoredDocs, func(i, j int) bool {
@@ -683,12 +692,6 @@ func (k *keywordIndex) search(query string, limit int) []schema.Document {
 	return out
 }
 
-var lexicalStopwords = map[string]struct{}{
-	"a": {}, "ao": {}, "aos": {}, "as": {}, "com": {}, "da": {}, "das": {}, "de": {}, "do": {}, "dos": {},
-	"e": {}, "em": {}, "na": {}, "nas": {}, "no": {}, "nos": {}, "o": {}, "os": {}, "ou": {}, "para": {},
-	"por": {}, "que": {}, "se": {}, "sem": {}, "um": {}, "uma": {},
-}
-
 func tokenize(text string) []string {
 	text = strings.TrimSpace(strings.ToLower(text))
 	if text == "" {
@@ -707,24 +710,24 @@ func tokenize(text string) []string {
 		if len([]rune(token)) < defaultMinTokenLength {
 			return
 		}
-		if _, stop := lexicalStopwords[token]; stop {
-			return
-		}
 		tokens = append(tokens, token)
 	}
 
 	for _, r := range text {
 		if unicode.IsLetter(r) || unicode.IsNumber(r) {
 			_, _ = b.WriteRune(r)
-			continue
+		} else {
+			flush()
 		}
-		flush()
 	}
 	flush()
 
 	return tokens
 }
 
+// truncateText shortens text to at most maxChars runes, breaking on a word
+// boundary within the last defaultTruncateLookback runes when possible,
+// and appending an ellipsis.
 func truncateText(text string, maxChars int) string {
 	text = strings.TrimSpace(text)
 	if text == "" || maxChars <= 0 {
@@ -741,14 +744,13 @@ func truncateText(text string, maxChars int) string {
 	if lookback > end {
 		lookback = end
 	}
-	for i := end; i > end-lookback; i-- {
-		if unicode.IsSpace(runes[i-1]) {
-			end = i - 1
+
+	// Walk back from the cut point to find a word boundary.
+	for i := end - 1; i >= end-lookback; i-- {
+		if unicode.IsSpace(runes[i]) {
+			end = i
 			break
 		}
-	}
-	if end <= 0 {
-		end = maxChars
 	}
 
 	return strings.TrimSpace(string(runes[:end])) + defaultTruncateEllipsis
