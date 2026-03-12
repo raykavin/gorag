@@ -20,20 +20,24 @@ var (
 	ErrParsingKnowledgeFile = errors.New("error parsing knowledge file")
 )
 
+const (
+	defKnowledgeRole = "user"
+	roleSystem       = "system"
+)
+
 // ReadKnowledge reads and parses a knowledge base JSON file, returning expanded chunks.
 func ReadKnowledge(path string) ([]models.KnowledgeChunk, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return nil, ErrReadingKnowledgeFile
+		return nil, fmt.Errorf("%w: %w", ErrReadingKnowledgeFile, err)
 	}
 
 	var chunks []models.KnowledgeChunk
 	if err := json.Unmarshal(content, &chunks); err != nil {
-		return nil, ErrParsingKnowledgeFile
+		return nil, fmt.Errorf("%w: %w", ErrParsingKnowledgeFile, err)
 	}
 
-	baseDir := filepath.Dir(path)
-	return expandKnowledgeChunks(chunks, baseDir)
+	return expandKnowledgeChunks(chunks, filepath.Dir(path))
 }
 
 // CountIndexableChunks returns the number of non-empty chunks.
@@ -58,101 +62,99 @@ func expandKnowledgeChunks(chunks []models.KnowledgeChunk, baseDir string) ([]mo
 		}
 
 		category := strings.TrimSpace(chunk.Category)
+		role := normalizeKnowledgeRole(chunk.Role)
 
-		// Add inline content if present.
 		if content := strings.TrimSpace(chunk.Content); content != "" {
 			expanded = append(expanded, models.KnowledgeChunk{
 				ID:       baseID,
 				Category: category,
+				Role:     role,
 				Content:  content,
 				Source:   strings.TrimSpace(chunk.Source),
 			})
 		}
 
-		fileIdx := 0
-
-		// Expand explicitly listed files.
-		for _, fRef := range chunk.Files {
-			fRef = strings.TrimSpace(fRef)
-			if fRef == "" {
-				continue
-			}
-
-			fPath := resolveKnowledgePath(baseDir, fRef)
-			fChunks, err := loadFileChunks(fPath)
-			if err != nil {
-				return nil, fmt.Errorf("error processing file %q in item %q: %w", fRef, baseID, err)
-			}
-
-			fileIDPart := sanitizeIDPart(fRef)
-			for chunkIdx, text := range fChunks {
-				text = strings.TrimSpace(text)
-				if text == "" {
-					continue
-				}
-				expanded = append(expanded, models.KnowledgeChunk{
-					ID:       buildChunkID(baseID, fileIDPart, fileIdx, chunkIdx, len(fChunks)),
-					Category: category,
-					Content:  text,
-					Source:   filepath.ToSlash(fRef),
-				})
-			}
-			fileIdx++
+		filePaths, err := resolveChunkFiles(chunk, baseDir)
+		if err != nil {
+			return nil, fmt.Errorf("item %q: %w", baseID, err)
 		}
 
-		// Expand files found in a directory path.
-		if filesPath := strings.TrimSpace(chunk.FilesPath); filesPath != "" {
-			collected, err := collectSupportedFiles(baseDir, filesPath)
-			if err != nil {
-				return nil, fmt.Errorf("error processing files_path %q in item %q: %w", filesPath, baseID, err)
-			}
-
-			for _, fPath := range collected {
-				fChunks, err := loadFileChunks(fPath)
-				if err != nil {
-					return nil, fmt.Errorf("error processing file %q in item %q: %w", fPath, baseID, err)
-				}
-
-				source := relativePathOrOriginal(baseDir, fPath)
-				fileIDPart := sanitizeIDPart(source)
-				for chunkIdx, text := range fChunks {
-					text = strings.TrimSpace(text)
-					if text == "" {
-						continue
-					}
-					expanded = append(expanded, models.KnowledgeChunk{
-						ID:       buildChunkID(baseID, fileIDPart, fileIdx, chunkIdx, len(fChunks)),
-						Category: category,
-						Content:  text,
-						Source:   source,
-					})
-				}
-				fileIdx++
-			}
+		fileChunks, err := expandFilePaths(filePaths, baseID, category, role, baseDir)
+		if err != nil {
+			return nil, fmt.Errorf("item %q: %w", baseID, err)
 		}
+
+		expanded = append(expanded, fileChunks...)
 	}
 
 	return expanded, nil
 }
 
-// resolveKnowledgePath resolves a file reference relative to the base directory or working directory.
-func resolveKnowledgePath(baseDir, fileRef string) string {
-	fileRef = filepath.Clean(strings.TrimSpace(fileRef))
-	if filepath.IsAbs(fileRef) {
-		return fileRef
-	}
+// resolveChunkFiles collects the ordered list of absolute file paths for a chunk,
+// combining explicitly listed files with those discovered under FilesPath.
+func resolveChunkFiles(chunk models.KnowledgeChunk, baseDir string) ([]string, error) {
+	var paths []string
 
-	if p := filepath.Join(baseDir, fileRef); fileExists(p) {
-		return p
-	}
-
-	if wd, err := os.Getwd(); err == nil {
-		if p := filepath.Join(wd, fileRef); fileExists(p) {
-			return p
+	for _, fRef := range chunk.Files {
+		fRef = strings.TrimSpace(fRef)
+		if fRef != "" {
+			paths = append(paths, resolveKnowledgePath(baseDir, fRef))
 		}
 	}
 
-	return filepath.Join(baseDir, fileRef)
+	if filesPath := strings.TrimSpace(chunk.FilesPath); filesPath != "" {
+		collected, err := collectSupportedFiles(baseDir, filesPath)
+		if err != nil {
+			return nil, fmt.Errorf("files_path %q: %w", filesPath, err)
+		}
+		paths = append(paths, collected...)
+	}
+
+	return paths, nil
+}
+
+// expandFilePaths loads chunks from each file path and converts them to
+// KnowledgeChunk records with stable, indexed IDs.
+func expandFilePaths(
+	paths []string,
+	baseID, category, role, baseDir string,
+) ([]models.KnowledgeChunk, error) {
+	var expanded []models.KnowledgeChunk
+
+	for fileIdx, fPath := range paths {
+		source := relativePathOrOriginal(baseDir, fPath)
+		fileIDPart := sanitizeIDPart(source)
+
+		textChunks, err := loadFileChunks(fPath)
+		if err != nil {
+			return nil, fmt.Errorf("file %q: %w", source, err)
+		}
+
+		for chunkIdx, text := range textChunks {
+			text = strings.TrimSpace(text)
+			if text == "" {
+				continue
+			}
+
+			chunkID := buildChunkID(
+				baseID,
+				fileIDPart,
+				fileIdx,
+				chunkIdx,
+				len(textChunks),
+			)
+
+			expanded = append(expanded, models.KnowledgeChunk{
+				ID:       chunkID,
+				Category: category,
+				Role:     role,
+				Content:  text,
+				Source:   source,
+			})
+		}
+	}
+
+	return expanded, nil
 }
 
 // collectSupportedFiles returns all supported files from a path (file or directory).
@@ -216,7 +218,7 @@ func loadTextChunks(path string) ([]string, error) {
 	return splitTextIntoChunks(text, defTextChunkSize, defTextChunkOverlap), nil
 }
 
-// loadCSVChunks reads a CSV file and groups rows into chunks.
+// loadCSVChunks reads a CSV file and groups rows into text chunks.
 func loadCSVChunks(path string) ([]string, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -251,62 +253,6 @@ func loadCSVChunks(path string) ([]string, error) {
 	}
 
 	return groupLinesIntoChunks(lines, defCSVRowsPerChunk), nil
-}
-
-// hasLikelyHeader reports whether the given row looks like a CSV header (no digits).
-func hasLikelyHeader(header []string) bool {
-	nonEmpty := 0
-	for _, v := range header {
-		v = strings.TrimSpace(v)
-		if v == "" {
-			continue
-		}
-		if strings.ContainsAny(v, "0123456789") {
-			return false
-		}
-		nonEmpty++
-	}
-	return nonEmpty > 0
-}
-
-// stringifyCSVRow formats a CSV row as a readable string.
-func stringifyCSVRow(rowNumber int, row, headers []string, useHeader bool) string {
-	parts := make([]string, 0, len(row))
-	for colIdx, raw := range row {
-		value := strings.TrimSpace(raw)
-		if value == "" {
-			continue
-		}
-		if useHeader && colIdx < len(headers) {
-			if h := strings.TrimSpace(headers[colIdx]); h != "" {
-				parts = append(parts, h+": "+value)
-				continue
-			}
-		}
-		parts = append(parts, "column "+strconv.Itoa(colIdx+1)+": "+value)
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return "row " + strconv.Itoa(rowNumber) + ": " + strings.Join(parts, "; ")
-}
-
-// groupLinesIntoChunks groups lines into chunks of at most chunkLines lines.
-func groupLinesIntoChunks(lines []string, chunkLines int) []string {
-	if chunkLines <= 0 {
-		chunkLines = defCSVRowsPerChunk
-	}
-	chunks := make([]string, 0, (len(lines)+chunkLines-1)/chunkLines)
-	for start := 0; start < len(lines); start += chunkLines {
-		end := start + chunkLines
-		if end > len(lines) {
-			end = len(lines)
-		}
-		if chunk := strings.TrimSpace(strings.Join(lines[start:end], "\n")); chunk != "" {
-			chunks = append(chunks, chunk)
-		}
-	}
-	return chunks
 }
 
 // splitTextIntoChunks splits text into overlapping rune-based chunks.
@@ -351,10 +297,66 @@ func splitTextIntoChunks(text string, chunkSize, overlap int) []string {
 	return chunks
 }
 
+// groupLinesIntoChunks groups lines into chunks of at most chunkLines lines.
+func groupLinesIntoChunks(lines []string, chunkLines int) []string {
+	if chunkLines <= 0 {
+		chunkLines = defCSVRowsPerChunk
+	}
+	chunks := make([]string, 0, (len(lines)+chunkLines-1)/chunkLines)
+	for start := 0; start < len(lines); start += chunkLines {
+		end := start + chunkLines
+		if end > len(lines) {
+			end = len(lines)
+		}
+		if chunk := strings.TrimSpace(strings.Join(lines[start:end], "\n")); chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+	}
+	return chunks
+}
+
 // normalizeLineBreaks converts all line endings to Unix-style \n.
 func normalizeLineBreaks(text string) string {
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	return strings.ReplaceAll(text, "\r", "\n")
+}
+
+// hasLikelyHeader reports whether the given row looks like a CSV header (no digits).
+func hasLikelyHeader(header []string) bool {
+	nonEmpty := 0
+	for _, v := range header {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if strings.ContainsAny(v, "0123456789") {
+			return false
+		}
+		nonEmpty++
+	}
+	return nonEmpty > 0
+}
+
+// stringifyCSVRow formats a CSV row as a readable string.
+func stringifyCSVRow(rowNumber int, row, headers []string, useHeader bool) string {
+	parts := make([]string, 0, len(row))
+	for colIdx, raw := range row {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		if useHeader && colIdx < len(headers) {
+			if h := strings.TrimSpace(headers[colIdx]); h != "" {
+				parts = append(parts, h+": "+value)
+				continue
+			}
+		}
+		parts = append(parts, "column "+strconv.Itoa(colIdx+1)+": "+value)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "row " + strconv.Itoa(rowNumber) + ": " + strings.Join(parts, "; ")
 }
 
 // buildChunkID constructs a unique chunk ID from its components.
@@ -392,6 +394,24 @@ func sanitizeIDPart(filePath string) string {
 	return "file"
 }
 
+// resolveKnowledgePath resolves a file reference relative to the base directory
+// or working directory, returning an absolute path.
+func resolveKnowledgePath(baseDir, fileRef string) string {
+	fileRef = filepath.Clean(strings.TrimSpace(fileRef))
+	if filepath.IsAbs(fileRef) {
+		return fileRef
+	}
+	if p := filepath.Join(baseDir, fileRef); fileExists(p) {
+		return p
+	}
+	if wd, err := os.Getwd(); err == nil {
+		if p := filepath.Join(wd, fileRef); fileExists(p) {
+			return p
+		}
+	}
+	return filepath.Join(baseDir, fileRef)
+}
+
 // relativePathOrOriginal returns path relative to baseDir, or the original slash-normalized path.
 func relativePathOrOriginal(baseDir, targetPath string) string {
 	rel, err := filepath.Rel(baseDir, targetPath)
@@ -415,4 +435,13 @@ func isSupportedExtension(path string) bool {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// normalizeKnowledgeRole returns roleSystem when role matches "system"
+// (case-insensitive), otherwise defKnowledgeRole.
+func normalizeKnowledgeRole(role string) string {
+	if strings.EqualFold(strings.TrimSpace(role), roleSystem) {
+		return roleSystem
+	}
+	return defKnowledgeRole
 }
